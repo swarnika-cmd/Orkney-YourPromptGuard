@@ -1,0 +1,49 @@
+version: '3.8'
+
+services:
+  web:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - DATABASE_URL=postgresql://postgres:postgres@db:5432/shieldwall
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-""}
+      - FAIL_SAFE_MODE=${FAIL_SAFE_MODE:-"fail_open"} # fail_open or fail_closed
+    depends_on:
+      - redis
+      - db
+    volumes:
+      - .:/app
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    command: redis-server --save "" --appendonly no # Ephemeral for high performance rate-limiting
+
+  db:
+    image: postgres:16-alpine
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=shieldwall
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  worker:
+    build: .
+    command: celery -A tasks worker --loglevel=info
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - DATABASE_URL=postgresql://postgres:postgres@db:5432/shieldwall
+    depends_on:
+      - redis
+      - db
+    volumes:
+      - .:/app
+
+volumes:
+  postgres_data:
