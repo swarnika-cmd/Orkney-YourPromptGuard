@@ -9,6 +9,7 @@ services:
       - REDIS_URL=redis://redis:6379/0
       - DATABASE_URL=postgresql://postgres:postgres@db:5432/shieldwall
       - OPENAI_API_KEY=${OPENAI_API_KEY:-""}
+      - GROQ_API_KEY=${GROQ_API_KEY:-""}
       - FAIL_SAFE_MODE=${FAIL_SAFE_MODE:-"fail_open"} # fail_open or fail_closed
     depends_on:
       - redis
@@ -39,6 +40,7 @@ services:
     environment:
       - REDIS_URL=redis://redis:6379/0
       - DATABASE_URL=postgresql://postgres:postgres@db:5432/shieldwall
+      - GROQ_API_KEY=${GROQ_API_KEY:-""}
     depends_on:
       - redis
       - db
