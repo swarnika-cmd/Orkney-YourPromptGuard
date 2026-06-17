@@ -19,15 +19,28 @@ logger = logging.getLogger("shieldwall")
 
 # Model Pricing: Cost per token (in USD)
 MODEL_PRICING = {
+    # OpenAI models
     "gpt-4o": {"input": 5.00 / 1_000_000, "output": 15.00 / 1_000_000},
     "gpt-4o-mini": {"input": 0.150 / 1_000_000, "output": 0.600 / 1_000_000},
     "gpt-3.5-turbo": {"input": 0.50 / 1_000_000, "output": 1.50 / 1_000_000},
     "gpt-4-turbo": {"input": 10.00 / 1_000_000, "output": 30.00 / 1_000_000},
     "gpt-4": {"input": 30.00 / 1_000_000, "output": 60.00 / 1_000_000},
+    # Groq models
+    "llama3-8b-8192": {"input": 0.05 / 1_000_000, "output": 0.08 / 1_000_000},
+    "llama3-70b-8192": {"input": 0.59 / 1_000_000, "output": 0.79 / 1_000_000},
+    "llama-3.1-8b-instant": {"input": 0.05 / 1_000_000, "output": 0.08 / 1_000_000},
+    "llama-3.1-70b-versatile": {"input": 0.59 / 1_000_000, "output": 0.79 / 1_000_000},
+    "mixtral-8x7b-32768": {"input": 0.24 / 1_000_000, "output": 0.24 / 1_000_000},
+    "gemma2-9b-it": {"input": 0.20 / 1_000_000, "output": 0.20 / 1_000_000},
 }
 DEFAULT_PRICING = {"input": 10.00 / 1_000_000, "output": 30.00 / 1_000_000}
 
-UPSTREAM_URL = os.getenv("UPSTREAM_URL", "https://api.openai.com/v1/chat/completions")
+# Determine default upstream based on available API Keys
+DEFAULT_UPSTREAM = "https://api.openai.com/v1/chat/completions"
+if os.getenv("GROQ_API_KEY"):
+    DEFAULT_UPSTREAM = "https://api.groq.com/openai/v1/chat/completions"
+
+UPSTREAM_URL = os.getenv("UPSTREAM_URL", DEFAULT_UPSTREAM)
 FAIL_SAFE_MODE = os.getenv("FAIL_SAFE_MODE", "fail_open") # fail_open or fail_closed
 BUDGET_LIMIT = 5.00 # $5.00 budget per 10 mins
 
@@ -719,9 +732,13 @@ async def chat_completions(request: Request, background_tasks: BackgroundTasks):
     # 4. Forwarding Authorization Credentials
     auth_header = request.headers.get("Authorization")
     if not auth_header:
-        api_key = os.getenv("OPENAI_API_KEY", "")
-        if api_key:
-            auth_header = f"Bearer {api_key}"
+        groq_key = os.getenv("GROQ_API_KEY", "")
+        if groq_key:
+            auth_header = f"Bearer {groq_key}"
+        else:
+            api_key = os.getenv("OPENAI_API_KEY", "")
+            if api_key:
+                auth_header = f"Bearer {api_key}"
 
     headers = {"Content-Type": "application/json"}
     if auth_header:
