@@ -6,7 +6,7 @@ import time
 from typing import List, Dict, Any
 
 # Configure environment for local testing
-os.environ["REDIS_URL"] = "redis://localhost:6379/0"
+os.environ["REDIS_URL"] = "redis://localhost:6380/0"
 os.environ["DATABASE_URL"] = "postgresql://postgres:postgres@db:5432/shieldwall"
 os.environ["FAIL_SAFE_MODE"] = "fail_closed"
 
