@@ -133,6 +133,10 @@ class MockPostgresCursor:
             return [("tenant_id",), ("total_cost",)]
         elif "avg(faithfulness)" in sql or "avg_faith" in sql:
             return [("count",), ("avg_faith",)]
+        elif "total_spend" in sql:
+            return [("total_spend",), ("blocked_injections",), ("avg_latency",)]
+        elif "extract(epoch" in sql:
+            return [("request_id",), ("tenant_id",), ("timestamp",), ("model",), ("latency_ms",), ("http_status",), ("violations_triggered",)]
         return [("id",)]
         
     def fetchall(self):
@@ -144,6 +148,10 @@ class MockPostgresCursor:
         elif "avg(faithfulness)" in sql or "avg_faith" in sql:
             global mock_faithfulness_avg, mock_faithfulness_count
             return [(mock_faithfulness_count, mock_faithfulness_avg)]
+        elif "total_spend" in sql:
+            return [(0.025, 3, 120.0)]
+        elif "extract(epoch" in sql:
+            return [("req_violation_1", "tenant_a", 1781793865.0, "gpt-4", 100, 200, "PII_MASKED")]
         return []
         
     def close(self):
@@ -569,6 +577,45 @@ async def run_tests():
             assert "Faithfulness Regression Detected!" in alert_payload
             assert "0.78" in alert_payload
             print("[OK] Success: Faithfulness regression loop detected low score and logged simulated Slack Webhook warning.")
+
+            # --- TEST 7: The Admin Dashboard Cockpit (Phase 6) ---
+            print("\n--- Test 7: The Admin Dashboard Cockpit (Phase 6) ---")
+            
+            # Reset/clear DB query recordings
+            postgres_db_store.clear()
+            
+            # Call Aggregation summary API
+            resp = await client.get("/api/analytics/summary")
+            assert resp.status_code == 200
+            summary_data = resp.json()
+            assert summary_data["total_spend"] == 0.025
+            assert summary_data["blocked_injections"] == 3
+            assert summary_data["avg_overhead_ms"] == 120.0
+            
+            summary_queries = [q for q in postgres_db_store if "total_spend" in q[0].lower()]
+            assert len(summary_queries) == 1
+            print("[OK] Success: /api/analytics/summary successfully returned overall KPIs.")
+
+            # Call GET /api/security/logs
+            postgres_db_store.clear()
+            # Set a mock trace mapping in the active Redis client
+            trace_id = "req_violation_1"
+            await active_redis_client.hset(f"trace:{trace_id}:mappings", mapping={"[REDACTED_EMAIL_1]": "user@example.com"})
+            
+            resp = await client.get("/api/security/logs")
+            assert resp.status_code == 200
+            logs_data = resp.json()
+            assert len(logs_data) == 1
+            log_item = logs_data[0]
+            assert log_item["request_id"] == "req_violation_1"
+            assert log_item["tenant_id"] == "tenant_a"
+            assert log_item["violations_triggered"] == "PII_MASKED"
+            # Ensure the PII mappings were resolved from Redis
+            assert log_item["pii_mappings"] == {"[REDACTED_EMAIL_1]": "user@example.com"}
+            
+            security_queries = [q for q in postgres_db_store if "extract(epoch" in q[0].lower()]
+            assert len(security_queries) == 1
+            print("[OK] Success: /api/security/logs successfully resolved log list and fetched PII mappings from Redis.")
 
     if not use_mock_redis:
         await active_redis_client.close()

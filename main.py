@@ -984,6 +984,72 @@ async def get_tenant_spend(window: str = "24h"):
         logger.error(f"Error fetching tenant spend: {e}")
         raise HTTPException(status_code=500, detail="Database query failed.")
 
+@app.get("/api/analytics/summary")
+async def get_analytics_summary():
+    query = """
+        SELECT 
+            COALESCE(SUM(cost), 0.0) as total_spend,
+            COUNT(*) FILTER (WHERE violations_triggered LIKE '%%BUDGET_EXCEEDED%%' OR violations_triggered LIKE '%%MALICIOUS_INJECTION%%') as blocked_injections,
+            COALESCE(AVG(latency_ms), 0.0) as avg_latency
+        FROM request_logs;
+    """
+    try:
+        rows = await asyncio.to_thread(query_db, query)
+        if not rows:
+            return {"total_spend": 0.0, "blocked_injections": 0, "avg_latency": 0.0}
+        row = rows[0]
+        return {
+            "total_spend": round(float(row.get("total_spend") or 0.0), 6),
+            "blocked_injections": int(row.get("blocked_injections") or 0),
+            "avg_overhead_ms": round(float(row.get("avg_latency") or 0.0), 2)
+        }
+    except Exception as e:
+        logger.error(f"Error fetching analytics summary: {e}")
+        raise HTTPException(status_code=500, detail="Database query failed.")
+
+@app.get("/api/security/logs")
+async def get_security_logs():
+    query = """
+        SELECT 
+            request_id, 
+            tenant_id, 
+            EXTRACT(EPOCH FROM timestamp) as timestamp, 
+            model, 
+            latency_ms, 
+            http_status, 
+            violations_triggered
+        FROM request_logs
+        WHERE violations_triggered IS NOT NULL AND violations_triggered != ''
+        ORDER BY timestamp DESC
+        LIMIT 100;
+    """
+    try:
+        rows = await asyncio.to_thread(query_db, query)
+        results = []
+        for row in rows:
+            req_id = row["request_id"]
+            # Fetch mappings from Redis if available
+            mappings = {}
+            if redis_client:
+                try:
+                    mappings = await load_pii_mappings(req_id)
+                except Exception:
+                    pass
+            results.append({
+                "request_id": req_id,
+                "tenant_id": row["tenant_id"],
+                "timestamp": float(row["timestamp"]),
+                "model": row["model"],
+                "latency_ms": int(row["latency_ms"]),
+                "http_status": int(row["http_status"]),
+                "violations_triggered": row["violations_triggered"],
+                "pii_mappings": mappings
+            })
+        return results
+    except Exception as e:
+        logger.error(f"Error fetching security logs: {e}")
+        raise HTTPException(status_code=500, detail="Database query failed.")
+
 @app.get("/health")
 async def health_check():
     redis_status = "unconnected"
@@ -999,3 +1065,11 @@ async def health_check():
         "redis": redis_status,
         "fail_safe_mode": FAIL_SAFE_MODE
     }
+
+# Serve static frontend dashboard if it has been built
+dashboard_dist_path = os.path.join(os.path.dirname(__file__), "dashboard", "dist")
+if os.path.exists(dashboard_dist_path):
+    from fastapi.staticfiles import StaticFiles
+    app.mount("/", StaticFiles(directory=dashboard_dist_path, html=True), name="static")
+    logger.info("Admin Dashboard Cockpit static files mounted at root.")
+
