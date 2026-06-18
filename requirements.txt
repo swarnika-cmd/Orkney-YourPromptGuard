@@ -1,3 +1,4 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
 fastapi>=0.110.0
 uvicorn>=0.28.0
 redis>=5.0.3
@@ -6,4 +7,5 @@ tiktoken>=0.6.0
 pydantic-settings>=2.2.1
 celery>=5.3.6
 psycopg2-binary>=2.9.9
+torch
 sentence-transformers>=2.5.1
