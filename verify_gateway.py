@@ -109,14 +109,42 @@ class MockRedis:
 
 # --- IN-MEMORY MOCK POSTGRES FALLBACK ---
 postgres_db_store = []
+mock_faithfulness_avg = 0.85
+mock_faithfulness_count = 5
 
 class MockPostgresCursor:
     def __init__(self, db_store):
         self.db_store = db_store
+        self.last_sql = ""
+        self.last_params = None
         
     def execute(self, sql, params=None):
         # Record the execute statement and params
         self.db_store.append((sql, params))
+        self.last_sql = sql
+        self.last_params = params
+
+    @property
+    def description(self):
+        sql = self.last_sql.lower()
+        if "percentile_cont" in sql:
+            return [("p95_latency",), ("total_cost",), ("avg_faithfulness",)]
+        elif "group by tenant_id" in sql:
+            return [("tenant_id",), ("total_cost",)]
+        elif "avg(faithfulness)" in sql or "avg_faith" in sql:
+            return [("count",), ("avg_faith",)]
+        return [("id",)]
+        
+    def fetchall(self):
+        sql = self.last_sql.lower()
+        if "percentile_cont" in sql:
+            return [(150.0, 0.0125, 0.850)]
+        elif "group by tenant_id" in sql:
+            return [("tenant_a", 0.010), ("tenant_b", 0.0025)]
+        elif "avg(faithfulness)" in sql or "avg_faith" in sql:
+            global mock_faithfulness_avg, mock_faithfulness_count
+            return [(mock_faithfulness_count, mock_faithfulness_avg)]
+        return []
         
     def close(self):
         pass
@@ -270,6 +298,21 @@ async def run_tests():
     def mock_connect(*args, **kwargs):
         return MockPostgresConnection(postgres_db_store)
     tasks.psycopg2.connect = mock_connect
+    main.psycopg2 = tasks.psycopg2
+
+    import psycopg2.pool
+    class MockSimpleConnectionPool:
+        def __init__(self, *args, **kwargs):
+            pass
+        def getconn(self):
+            return MockPostgresConnection(postgres_db_store)
+        def putconn(self, conn):
+            pass
+        def closeall(self):
+            pass
+    psycopg2.pool.SimpleConnectionPool = MockSimpleConnectionPool
+    main.ALERT_LOOP_INTERVAL = 0.01
+    main.ALERT_COOLDOWN_PERIOD = 0.0
 
     # 1. Establish Redis mode
     import redis.asyncio as aioredis
@@ -469,6 +512,63 @@ async def run_tests():
             insert_sql, insert_params = insert_queries[0]
             assert params[2] == insert_params[0] # request_id is the first param in INSERT
             print("[OK] Success: Relevance (0.806) and Faithfulness (0.818) correctly calculated and updated in Postgres.")
+
+            # --- TEST 6: The Aggregation API & Real-Time Alerts (Phase 5) ---
+            print("\n--- Test 6: The Aggregation API & Real-Time Alerts (Phase 5) ---")
+            
+            # Reset/clear DB query recordings
+            postgres_db_store.clear()
+            
+            # Call Aggregation API GET /api/analytics
+            resp = await client.get("/api/analytics?window=24h")
+            assert resp.status_code == 200
+            data = resp.json()
+            assert data["p95_latency"] == 150.0
+            assert data["total_cost"] == 0.0125
+            assert data["avg_faithfulness"] == 0.85
+            
+            # Verify the queries executed
+            analytics_queries = [q for q in postgres_db_store if "percentile_cont" in q[0].lower()]
+            assert len(analytics_queries) == 1
+            print("[OK] Success: /api/analytics successfully returned aggregated mock metrics.")
+
+            # Call GET /api/analytics/tenants
+            postgres_db_store.clear()
+            resp = await client.get("/api/analytics/tenants?window=24h")
+            assert resp.status_code == 200
+            data = resp.json()
+            assert len(data) == 2
+            assert data[0]["tenant_id"] == "tenant_a"
+            assert data[0]["total_cost"] == 0.010
+            assert data[1]["tenant_id"] == "tenant_b"
+            assert data[1]["total_cost"] == 0.0025
+            
+            tenant_queries = [q for q in postgres_db_store if "group by tenant_id" in q[0].lower()]
+            assert len(tenant_queries) == 1
+            print("[OK] Success: /api/analytics/tenants successfully returned tenant spends.")
+
+            # Test Alert Loop functionality
+            global mock_faithfulness_avg
+            # Set threshold regression trigger: avg_faith = 0.78 (< 0.82)
+            mock_faithfulness_avg = 0.78
+            
+            # Setup logging interceptor to capture warning alerts
+            warnings_logged = []
+            def mock_warning(msg, *args, **kwargs):
+                warnings_logged.append(msg)
+            main.logger.warning = mock_warning
+
+            # Wait briefly to let the background loop execute at least once with interval 0.01s
+            await asyncio.sleep(0.05)
+            
+            # Check if warning alert was registered
+            alerts = [w for w in warnings_logged if "[ALERT]" in w]
+            assert len(alerts) > 0, "Regression alerting loop should log a simulated Slack webhook warning"
+            alert_payload = alerts[0]
+            print(f"Captured alert: {alert_payload}")
+            assert "Faithfulness Regression Detected!" in alert_payload
+            assert "0.78" in alert_payload
+            print("[OK] Success: Faithfulness regression loop detected low score and logged simulated Slack Webhook warning.")
 
     if not use_mock_redis:
         await active_redis_client.close()

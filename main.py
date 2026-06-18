@@ -124,9 +124,93 @@ end
 return current_sum
 """
 
+# Database configuration
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@db:5432/shieldwall")
+db_pool = None
+alert_task = None
+
+ALERT_LOOP_INTERVAL = 60.0
+ALERT_COOLDOWN_PERIOD = 600.0
+
+def query_db(query: str, params: tuple = None, is_update: bool = False):
+    """Executes a query against Postgres database using the connection pool or a direct connection."""
+    import psycopg2
+    conn = None
+    try:
+        if db_pool:
+            conn = db_pool.getconn()
+        else:
+            conn = psycopg2.connect(DATABASE_URL)
+        
+        with conn.cursor() as cur:
+            cur.execute(query, params)
+            if is_update:
+                conn.commit()
+                return None
+            else:
+                if cur.description is None:
+                    return []
+                columns = [desc[0] for desc in cur.description]
+                rows = cur.fetchall()
+                return [dict(zip(columns, row)) for row in rows]
+    except Exception as e:
+        logger.error(f"Database query error: {e}")
+        raise e
+    finally:
+        if conn:
+            if db_pool:
+                db_pool.putconn(conn)
+            else:
+                conn.close()
+
+async def regression_alert_loop():
+    logger.info("Faithfulness regression alerting loop started.")
+    last_alert_time = 0
+    threshold = float(os.getenv("ALERT_FAITHFULNESS_THRESHOLD", "0.82"))
+    
+    while True:
+        try:
+            await asyncio.sleep(ALERT_LOOP_INTERVAL)
+            
+            # Query the average faithfulness in the last 10 minutes
+            query = """
+                SELECT 
+                    COUNT(*) as count,
+                    AVG(faithfulness) as avg_faith
+                FROM request_logs
+                WHERE timestamp >= NOW() - INTERVAL '10 minutes'
+                  AND faithfulness IS NOT NULL;
+            """
+            rows = await asyncio.to_thread(query_db, query)
+            if rows and rows[0]["count"] > 0:
+                count = rows[0]["count"]
+                avg_faith = float(rows[0]["avg_faith"] or 0.0)
+                
+                if avg_faith < threshold:
+                    now = time.time()
+                    if now - last_alert_time > ALERT_COOLDOWN_PERIOD:
+                        last_alert_time = now
+                        # Emit alert to logs
+                        slack_payload = {
+                            "text": f"🚨 *ShieldWall Alert: Faithfulness Regression Detected!* 🚨\n"
+                                    f"The average faithfulness score over the last 10 minutes is *{avg_faith:.3f}* "
+                                    f"(Threshold: *{threshold:.2f}*, Sample count: {count}).\n"
+                                    f"This may indicate severe prompt drift or system degradation."
+                        }
+                        logger.warning(
+                            f"[ALERT] [Slack Webhook Sim] Faithfulness regression detected! "
+                            f"Average faithfulness in the last 10m is {avg_faith:.3f} (Threshold: {threshold:.2f}). "
+                            f"Payload: {json.dumps(slack_payload)}"
+                        )
+        except asyncio.CancelledError:
+            logger.info("Faithfulness regression alerting loop cancelled.")
+            break
+        except Exception as e:
+            logger.error(f"Error in regression alert loop: {e}")
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global redis_client, http_client
+    global redis_client, http_client, db_pool, alert_task
     redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
     logger.info(f"Connecting to Redis at {redis_url}...")
     redis_client = aioredis.from_url(redis_url, decode_responses=True)
@@ -142,10 +226,33 @@ async def lifespan(app: FastAPI):
     # Persistent HTTP client with connection pool for ultra-low proxy overhead
     http_client = httpx.AsyncClient(timeout=60.0)
     logger.info("HTTP persistent client initialized.")
+
+    # Initialize DB connection pool
+    try:
+        from psycopg2.pool import SimpleConnectionPool
+        logger.info(f"Initializing DB connection pool for {DATABASE_URL}...")
+        db_pool = SimpleConnectionPool(1, 10, dsn=DATABASE_URL)
+        logger.info("DB connection pool initialized.")
+    except Exception as e:
+        logger.error(f"Failed to initialize DB connection pool: {e}")
+
+    # Start the alerting background loop
+    alert_task = asyncio.create_task(regression_alert_loop())
     
     yield
     
+    # Cancel alert loop on shutdown
+    if alert_task:
+        alert_task.cancel()
+        try:
+            await alert_task
+        except asyncio.CancelledError:
+            pass
+            
     # Clean up connections on shutdown
+    if db_pool:
+        db_pool.closeall()
+        logger.info("DB connection pool closed.")
     if redis_client:
         await redis_client.close()
         logger.info("Redis client connection closed.")
@@ -806,6 +913,76 @@ async def chat_completions(request: Request, background_tasks: BackgroundTasks):
             user_query=user_query,
             rag_context=rag_context
         )
+
+@app.get("/api/analytics")
+async def get_analytics(window: str = "24h"):
+    if window not in ["1h", "24h", "30d"]:
+        raise HTTPException(status_code=400, detail="Invalid window parameter. Choose from 1h, 24h, 30d.")
+        
+    if window == "1h":
+        interval = "1 hour"
+    elif window == "30d":
+        interval = "30 days"
+    else:
+        interval = "24 hours"
+        
+    query = """
+        SELECT 
+            COALESCE(percentile_cont(0.95) WITHIN GROUP (ORDER BY latency_ms), 0.0) as p95_latency,
+            COALESCE(SUM(cost), 0.0) as total_cost,
+            COALESCE(AVG(faithfulness), 0.0) as avg_faithfulness
+        FROM request_logs
+        WHERE timestamp >= NOW() - CAST(%s AS INTERVAL);
+    """
+    
+    try:
+        rows = await asyncio.to_thread(query_db, query, (interval,))
+        if not rows:
+            return {"p95_latency": 0.0, "total_cost": 0.0, "avg_faithfulness": 0.0}
+        row = rows[0]
+        return {
+            "p95_latency": round(float(row.get("p95_latency") or 0.0), 2),
+            "total_cost": round(float(row.get("total_cost") or 0.0), 6),
+            "avg_faithfulness": round(float(row.get("avg_faithfulness") or 0.0), 3)
+        }
+    except Exception as e:
+        logger.error(f"Error fetching analytics: {e}")
+        raise HTTPException(status_code=500, detail="Database query failed.")
+
+@app.get("/api/analytics/tenants")
+async def get_tenant_spend(window: str = "24h"):
+    if window not in ["1h", "24h", "30d"]:
+        raise HTTPException(status_code=400, detail="Invalid window parameter. Choose from 1h, 24h, 30d.")
+        
+    if window == "1h":
+        interval = "1 hour"
+    elif window == "30d":
+        interval = "30 days"
+    else:
+        interval = "24 hours"
+        
+    query = """
+        SELECT 
+            tenant_id,
+            COALESCE(SUM(cost), 0.0) as total_cost
+        FROM request_logs
+        WHERE timestamp >= NOW() - CAST(%s AS INTERVAL)
+        GROUP BY tenant_id
+        ORDER BY total_cost DESC;
+    """
+    
+    try:
+        rows = await asyncio.to_thread(query_db, query, (interval,))
+        results = []
+        for row in rows:
+            results.append({
+                "tenant_id": row["tenant_id"],
+                "total_cost": round(float(row["total_cost"]), 6)
+            })
+        return results
+    except Exception as e:
+        logger.error(f"Error fetching tenant spend: {e}")
+        raise HTTPException(status_code=500, detail="Database query failed.")
 
 @app.get("/health")
 async def health_check():
