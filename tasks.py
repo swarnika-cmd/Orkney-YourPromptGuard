@@ -1,6 +1,8 @@
 import os
 import logging
+import math
 import psycopg2
+from typing import List, Tuple
 from celery import Celery
 from celery.signals import worker_ready
 
@@ -14,7 +16,7 @@ DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@db:5432
 # Initialize Celery Application
 celery_app = Celery("shieldwall", broker=REDIS_URL, backend=REDIS_URL)
 
-# Configure Celery (enable standard serialization)
+# Configure Celery
 celery_app.conf.update(
     task_serializer="json",
     accept_content=["json"],
@@ -41,10 +43,67 @@ MODEL_PRICING = {
 }
 DEFAULT_PRICING = {"input": 10.00 / 1_000_000, "output": 30.00 / 1_000_000}
 
+# Global CrossEncoder Instance
+cross_encoder_model = None
+
+def get_cross_encoder():
+    """Lazily loads or returns the global CrossEncoder model."""
+    global cross_encoder_model
+    if cross_encoder_model is None:
+        try:
+            from sentence_transformers import CrossEncoder
+            logger.info("Loading Cross-Encoder model (cross-encoder/ms-marco-MiniLM-L-6-v2)...")
+            cross_encoder_model = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+            logger.info("Cross-Encoder model loaded successfully.")
+        except Exception as e:
+            logger.error(f"Failed to load Cross-Encoder model: {e}")
+    return cross_encoder_model
+
 def calculate_cost(model: str, input_tokens: int, output_tokens: int) -> float:
     """Calculates the absolute cost of the request based on model pricing."""
     pricing = MODEL_PRICING.get(model, DEFAULT_PRICING)
     return (input_tokens * pricing["input"]) + (output_tokens * pricing["output"])
+
+def sigmoid(x: float) -> float:
+    """Standard sigmoid activation mapping raw logit scores to [0.0, 1.0]."""
+    try:
+        return 1.0 / (1.0 + math.exp(-x))
+    except OverflowError:
+        return 0.0 if x < 0 else 1.0
+
+def evaluate_rag_metrics(user_query: str, rag_context: List[str], response_text: str) -> Tuple[float, float]:
+    """Uses Cross-Encoder to compute Context Relevance and Faithfulness scores."""
+    model = get_cross_encoder()
+    if not model or not rag_context:
+        return 0.0, 0.0
+
+    # 1. Context Relevance: score (user_query, context_chunk) pairs
+    try:
+        relevance_pairs = [(user_query, chunk) for chunk in rag_context]
+        relevance_logits = model.predict(relevance_pairs)
+        # Handle single float output if rag_context contains only 1 element
+        if isinstance(relevance_logits, (int, float)):
+            relevance_logits = [relevance_logits]
+        relevance_scores = [sigmoid(float(logit)) for logit in relevance_logits]
+        context_relevance = sum(relevance_scores) / len(relevance_scores)
+    except Exception as e:
+        logger.error(f"Failed to score context relevance: {e}")
+        context_relevance = 0.0
+
+    # 2. Faithfulness: score (context_chunk, response_text) pairs
+    try:
+        faithfulness_pairs = [(chunk, response_text) for chunk in rag_context]
+        faithfulness_logits = model.predict(faithfulness_pairs)
+        if isinstance(faithfulness_logits, (int, float)):
+            faithfulness_logits = [faithfulness_logits]
+        faithfulness_scores = [sigmoid(float(logit)) for logit in faithfulness_logits]
+        # Max score indicates if at least one chunk grounds the response
+        faithfulness = max(faithfulness_scores)
+    except Exception as e:
+        logger.error(f"Failed to score faithfulness: {e}")
+        faithfulness = 0.0
+
+    return round(context_relevance, 3), round(faithfulness, 3)
 
 def init_db():
     """Initializes the database by executing our time-series logs migration schema."""
@@ -56,7 +115,6 @@ def init_db():
     with open(schema_path, "r") as f:
         schema_sql = f.read()
 
-    # Parse parameters from DATABASE_URL or let psycopg2 resolve it directly
     conn = psycopg2.connect(DATABASE_URL)
     try:
         with conn.cursor() as cur:
@@ -70,7 +128,7 @@ def init_db():
     finally:
         conn.close()
 
-# Auto-apply database migration schema when worker is ready
+# Auto-apply database migration schema and preload ML models on worker ready
 @worker_ready.connect
 def on_worker_ready(sender, **kwargs):
     logger.info("Celery worker process ready. Syncing Postgres database schema...")
@@ -78,6 +136,44 @@ def on_worker_ready(sender, **kwargs):
         init_db()
     except Exception as e:
         logger.critical(f"Database migration aborted during startup: {e}")
+        
+    # Preload the Cross-Encoder model
+    try:
+        get_cross_encoder()
+    except Exception as e:
+        logger.warning(f"Could not preload Cross-Encoder model at startup: {e}")
+
+@celery_app.task(name="tasks.evaluate_request_quality")
+def evaluate_request_quality(request_id: str, user_query: str, rag_context: List[str], response_text: str) -> str:
+    """Background task evaluating context relevance and faithfulness, persisting results to Postgres."""
+    if not user_query or not rag_context or not response_text:
+        logger.info(f"Skipping evaluation for request '{request_id}': missing user_query, rag_context, or response_text.")
+        return request_id
+
+    logger.info(f"Starting async quality evaluation for request '{request_id}'...")
+    context_relevance, faithfulness = evaluate_rag_metrics(user_query, rag_context, response_text)
+
+    conn = psycopg2.connect(DATABASE_URL)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE request_logs
+                SET context_relevance = %s, faithfulness = %s
+                WHERE request_id = %s;
+                """,
+                (context_relevance, faithfulness, request_id)
+            )
+            conn.commit()
+            logger.info(f"Updated request '{request_id}' quality scores: relevance={context_relevance:.3f}, faithfulness={faithfulness:.3f}")
+    except Exception as e:
+        conn.rollback()
+        logger.error(f"Failed to save evaluation scores for request '{request_id}': {e}")
+        raise e
+    finally:
+        conn.close()
+
+    return request_id
 
 @celery_app.task(name="tasks.log_request")
 def log_request(payload: dict) -> str:
@@ -129,5 +225,13 @@ def log_request(payload: dict) -> str:
         raise e
     finally:
         conn.close()
+
+    # Trigger evaluation asynchronously if RAG metadata is available
+    user_query = payload.get("user_query")
+    rag_context = payload.get("rag_context")
+    response_text = payload.get("response_text")
+
+    if user_query and rag_context and response_text:
+        evaluate_request_quality.delay(request_id, user_query, rag_context, response_text)
 
     return request_id

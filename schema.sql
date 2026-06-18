@@ -11,8 +11,14 @@ CREATE TABLE IF NOT EXISTS request_logs (
     input_tokens INTEGER NOT NULL,
     output_tokens INTEGER NOT NULL,
     cost NUMERIC(10, 6) NOT NULL,
-    violations_triggered VARCHAR(256)
+    violations_triggered VARCHAR(256),
+    context_relevance NUMERIC(4, 3),
+    faithfulness NUMERIC(4, 3)
 );
+
+-- Idempotent migrations for existing tables
+ALTER TABLE request_logs ADD COLUMN IF NOT EXISTS context_relevance NUMERIC(4, 3);
+ALTER TABLE request_logs ADD COLUMN IF NOT EXISTS faithfulness NUMERIC(4, 3);
 
 -- Optimize for dashboard aggregations filtering by tenant over time
 CREATE INDEX IF NOT EXISTS idx_tenant_timestamp ON request_logs(tenant_id, timestamp DESC);

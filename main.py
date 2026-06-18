@@ -324,7 +324,10 @@ async def log_request_background(
     output_tokens: int,
     latency_ms: int,
     http_status: int,
-    violations_triggered: str
+    violations_triggered: str,
+    user_query: str = None,
+    rag_context: List[str] = None,
+    response_text: str = None
 ):
     """Background task executing cost accounting in Redis and database logging in Celery."""
     # 1. Compute Cost
@@ -333,7 +336,7 @@ async def log_request_background(
     # 2. Record cost in Redis for sliding budget gates
     await record_project_cost(project_id, request_id, cost)
     
-    # 3. Push to Celery queue for database ingestion
+    # 3. Push to Celery queue for database ingestion and async evaluation
     enqueue_request_log({
         "request_id": request_id,
         "tenant_id": project_id,
@@ -344,7 +347,10 @@ async def log_request_background(
         "http_status": http_status,
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
-        "violations_triggered": violations_triggered
+        "violations_triggered": violations_triggered,
+        "user_query": user_query,
+        "rag_context": rag_context,
+        "response_text": response_text
     })
 
 # --- PROXY HANDLERS ---
@@ -356,7 +362,9 @@ async def handle_non_streaming_proxy(
     model: str,
     input_tokens: int,
     background_tasks: BackgroundTasks,
-    violations_triggered: str = ""
+    violations_triggered: str = "",
+    user_query: str = None,
+    rag_context: List[str] = None
 ) -> Response:
     start_time = time.perf_counter()
     try:
@@ -375,7 +383,9 @@ async def handle_non_streaming_proxy(
             output_tokens=0,
             latency_ms=0,
             http_status=status.HTTP_502_BAD_GATEWAY,
-            violations_triggered="UPSTREAM_ERROR"
+            violations_triggered="UPSTREAM_ERROR",
+            user_query=user_query,
+            rag_context=rag_context
         )
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
@@ -392,7 +402,9 @@ async def handle_non_streaming_proxy(
             output_tokens=0,
             latency_ms=latency_ms,
             http_status=response.status_code,
-            violations_triggered="UPSTREAM_ERROR"
+            violations_triggered="UPSTREAM_ERROR",
+            user_query=user_query,
+            rag_context=rag_context
         )
         return Response(
             content=response.content,
@@ -412,7 +424,9 @@ async def handle_non_streaming_proxy(
             output_tokens=0,
             latency_ms=latency_ms,
             http_status=response.status_code,
-            violations_triggered="INVALID_RESPONSE"
+            violations_triggered="INVALID_RESPONSE",
+            user_query=user_query,
+            rag_context=rag_context
         )
         return Response(
             content=response.content,
@@ -429,6 +443,12 @@ async def handle_non_streaming_proxy(
             if "content" in message and message["content"]:
                 message["content"] = unmask_text(message["content"], mappings)
 
+    # Extract response text for async evaluation scoring
+    response_text = ""
+    if "choices" in response_json and response_json["choices"]:
+        msg = response_json["choices"][0].get("message", {})
+        response_text = msg.get("content", "")
+
     usage = response_json.get("usage", {})
     prompt_tokens = usage.get("prompt_tokens", input_tokens)
     completion_tokens = usage.get("completion_tokens", 0)
@@ -444,7 +464,10 @@ async def handle_non_streaming_proxy(
         output_tokens=completion_tokens,
         latency_ms=latency_ms,
         http_status=response.status_code,
-        violations_triggered=violation_str
+        violations_triggered=violation_str,
+        user_query=user_query,
+        rag_context=rag_context,
+        response_text=response_text
     )
 
     # Forward upstream response headers cleanly, adjusting Content-Length
@@ -464,7 +487,9 @@ async def handle_streaming_proxy(
     model: str,
     input_tokens: int,
     background_tasks: BackgroundTasks,
-    violations_triggered: str = ""
+    violations_triggered: str = "",
+    user_query: str = None,
+    rag_context: List[str] = None
 ) -> StreamingResponse:
     start_time = time.perf_counter()
     async def generator():
@@ -497,7 +522,9 @@ async def handle_streaming_proxy(
                 "http_status": status.HTTP_502_BAD_GATEWAY,
                 "input_tokens": input_tokens,
                 "output_tokens": 0,
-                "violations_triggered": "UPSTREAM_ERROR"
+                "violations_triggered": "UPSTREAM_ERROR",
+                "user_query": user_query,
+                "rag_context": rag_context
             })
             return
 
@@ -517,7 +544,9 @@ async def handle_streaming_proxy(
                 "http_status": response.status_code,
                 "input_tokens": input_tokens,
                 "output_tokens": 0,
-                "violations_triggered": "UPSTREAM_ERROR"
+                "violations_triggered": "UPSTREAM_ERROR",
+                "user_query": user_query,
+                "rag_context": rag_context
             })
             return
 
@@ -623,7 +652,7 @@ async def handle_streaming_proxy(
             # 1. Update Redis budget
             await record_project_cost(project_id, request_id, cost)
             
-            # 2. Enqueue metrics payload to celery queue
+            # 2. Enqueue metrics payload to celery queue, carrying response text
             violation_str = "PII_MASKED" if (violations_triggered or has_pii) else ""
             enqueue_request_log({
                 "request_id": request_id,
@@ -635,7 +664,10 @@ async def handle_streaming_proxy(
                 "http_status": http_status_code,
                 "input_tokens": prompt_tokens,
                 "output_tokens": completion_tokens,
-                "violations_triggered": violation_str
+                "violations_triggered": violation_str,
+                "user_query": user_query,
+                "rag_context": rag_context,
+                "response_text": "".join(accumulated_text)
             })
 
     return StreamingResponse(
@@ -686,6 +718,10 @@ async def chat_completions(request: Request, background_tasks: BackgroundTasks):
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Invalid request body. Content must be JSON."
         )
+
+    # Intercept RAG evaluation metadata from body (pop to avoid forwarding to provider)
+    user_query = body.pop("user_query", None)
+    rag_context = body.pop("rag_context", None)
 
     model = body.get("model", "gpt-4o-mini")
     messages = body.get("messages", [])
@@ -753,7 +789,9 @@ async def chat_completions(request: Request, background_tasks: BackgroundTasks):
             model=model,
             input_tokens=input_tokens,
             background_tasks=background_tasks,
-            violations_triggered="PII_MASKED" if mappings else ""
+            violations_triggered="PII_MASKED" if mappings else "",
+            user_query=user_query,
+            rag_context=rag_context
         )
     else:
         return await handle_non_streaming_proxy(
@@ -764,7 +802,9 @@ async def chat_completions(request: Request, background_tasks: BackgroundTasks):
             model=model,
             input_tokens=input_tokens,
             background_tasks=background_tasks,
-            violations_triggered="PII_MASKED" if mappings else ""
+            violations_triggered="PII_MASKED" if mappings else "",
+            user_query=user_query,
+            rag_context=rag_context
         )
 
 @app.get("/health")

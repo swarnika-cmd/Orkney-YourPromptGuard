@@ -230,9 +230,33 @@ mock_stream_split_tokens = [
     b'data: [DONE]\n'
 ]
 
+class MockCrossEncoder:
+    def predict(self, pairs: List[List[str]]) -> List[float]:
+        logits = []
+        for prompt, response in pairs:
+            # Distinguish between relevance and faithfulness by query content
+            if "query" in prompt:
+                # Relevance: (user_query, chunk)
+                if "chunk1" in response:
+                    logits.append(1.0)
+                elif "chunk2" in response:
+                    logits.append(2.0)
+                else:
+                    logits.append(0.0)
+            else:
+                # Faithfulness: (chunk, response)
+                if "chunk1" in prompt:
+                    logits.append(-1.0)
+                elif "chunk2" in prompt:
+                    logits.append(1.5)
+                else:
+                    logits.append(0.0)
+        return logits
+
 async def clear_redis_keys(redis_client, project_id: str):
     await redis_client.delete(f"project:budget:10m:zset:{project_id}")
     await redis_client.delete(f"project:budget:10m:sum:{project_id}")
+
 
 async def run_tests():
     global mocked_received_payload, postgres_db_store
@@ -399,6 +423,52 @@ async def run_tests():
             assert params[6] == 429
             assert params[10] == "BUDGET_EXCEEDED"
             print("[OK] Success: Blocked request correctly recorded as BUDGET_EXCEEDED in Postgres database.")
+
+            # --- TEST 5: Automated Async Evaluation Engine (Phase 4) ---
+            print("\n--- Test 5: Automated Async Evaluation Engine (Phase 4) ---")
+            postgres_db_store.clear()
+            await clear_redis_keys(active_redis_client, project_a)
+
+            # Assign our MockCrossEncoder to tasks.cross_encoder_model
+            tasks.cross_encoder_model = MockCrossEncoder()
+
+            rag_payload = {
+                "model": "gpt-4",
+                "messages": [{"role": "user", "content": "Tell me about the retrieval chunks."}],
+                "user_query": "test query",
+                "rag_context": ["chunk1", "chunk2"],
+                "stream": False
+            }
+
+            resp = await client.post("/v1/chat/completions", json=rag_payload, headers=headers)
+            assert resp.status_code == 200
+
+            # Wait briefly to let background tasks/Celery run
+            await asyncio.sleep(0.05)
+
+            # Verify that user_query and rag_context were NOT forwarded to the upstream LLM
+            assert "user_query" not in mocked_received_payload
+            assert "rag_context" not in mocked_received_payload
+            print("[OK] Success: user_query and rag_context popped and not forwarded upstream.")
+
+            # Find the INSERT query in postgres_db_store
+            insert_queries = [q for q in postgres_db_store if "INSERT INTO request_logs" in q[0]]
+            assert len(insert_queries) == 1, "Should record exactly one insert command"
+            print("[OK] Success: Request log inserted.")
+
+            # Find the UPDATE query in postgres_db_store representing the quality evaluation
+            update_queries = [q for q in postgres_db_store if "UPDATE request_logs" in q[0]]
+            assert len(update_queries) == 1, f"Should record exactly one update command, got {len(update_queries)}"
+            
+            sql, params = update_queries[0]
+            print(f"Recorded update parameters: {params}")
+            # Params format: (context_relevance, faithfulness, request_id)
+            assert params[0] == 0.806
+            assert params[1] == 0.818
+            # The request_id should match the one inserted in the INSERT query
+            insert_sql, insert_params = insert_queries[0]
+            assert params[2] == insert_params[0] # request_id is the first param in INSERT
+            print("[OK] Success: Relevance (0.806) and Faithfulness (0.818) correctly calculated and updated in Postgres.")
 
     if not use_mock_redis:
         await active_redis_client.close()
