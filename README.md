@@ -197,11 +197,17 @@ CREATE INDEX IF NOT EXISTS idx_timestamp_latency ON request_logs(timestamp DESC,
     *Note: If port `5432` is already allocated by an active PostgreSQL server on your host machine, the database container will automatically bind to port `5435` on localhost, preventing configuration conflicts.*
 
 3.  **Access the Applications**:
-    *   **Admin Dashboard Cockpit**: [http://localhost:8000/](http://localhost:8000/)
-    *   **Interactive Swagger API Docs**: [http://localhost:8000/docs](http://localhost:8000/docs)
-    *   **LLM Gateway Endpoint**: `http://localhost:8000/v1/chat/completions` (Compatible with any standard OpenAI SDK wrapper)
-    *   **API Telemetry Endpoints**:
-        *   Summary Metrics: `GET http://localhost:8000/api/analytics/summary`
-        *   Window Analytics: `GET http://localhost:8000/api/analytics?window=24h`
-        *   Tenant Rankings: `GET http://localhost:8000/api/analytics/tenants?window=24h`
-        *   Security Logs: `GET http://localhost:8000/api/security/logs`
+
+    ### 🚀 Live Production Deployment (Hugging Face Spaces)
+    | Service / Interface | URL / Endpoint | Description |
+    | :--- | :--- | :--- |
+    | **🖥️ Admin Dashboard** | [Open Space Cockpit](https://huggingface.co/spaces/swarnikazzzzz/Orkeney) | View logs, lookback metrics, and active tenant costs |
+    | **🛡️ Swagger API Docs** | [Open Swagger UI](https://swarnikazzzzz-orkeney.hf.space/docs) | Interactive OpenAPI console to test proxy requests |
+    | **🔑 Gateway Endpoint** | `https://swarnikazzzzz-orkeney.hf.space/v1/chat/completions` | Live proxy endpoint compatible with OpenAI SDKs |
+
+    ### 💻 Local Development (Docker Compose)
+    | Service / Interface | URL / Endpoint | Description |
+    | :--- | :--- | :--- |
+    | **🖥️ Admin Dashboard** | [http://localhost:8000/](http://localhost:8000/) | Local observability console and event logs |
+    | **🛡️ Swagger API Docs** | [http://localhost:8000/docs](http://localhost:8000/docs) | Local OpenAPI interactive documentation page |
+    | **🔑 Gateway Endpoint** | `http://localhost:8000/v1/chat/completions` | Local proxy endpoint for offline testing |
