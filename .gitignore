@@ -5,3 +5,4 @@ __pycache__/
 .env
 .pytest_cache/
 .ipynb_checkpoints/
+STAR_PROJECT_DESCRIPTION.md
