@@ -1,3 +1,13 @@
+---
+title: ShieldWall Gateway
+emoji: 🛡️
+colorFrom: blue
+colorTo: indigo
+sdk: docker
+app_port: 7860
+pinned: false
+---
+
 # 🛡️ ShieldWall Gateway: Enterprise LLM Security & Telemetry Control Room
 
 ![ShieldWall Gateway Dashboard](dashboard.png)
