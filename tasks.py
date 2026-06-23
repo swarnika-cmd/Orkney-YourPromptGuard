@@ -38,6 +38,7 @@ MODEL_PRICING = {
     "llama3-70b-8192": {"input": 0.59 / 1_000_000, "output": 0.79 / 1_000_000},
     "llama-3.1-8b-instant": {"input": 0.05 / 1_000_000, "output": 0.08 / 1_000_000},
     "llama-3.1-70b-versatile": {"input": 0.59 / 1_000_000, "output": 0.79 / 1_000_000},
+    "llama-3.3-70b-versatile": {"input": 0.59 / 1_000_000, "output": 0.79 / 1_000_000},
     "mixtral-8x7b-32768": {"input": 0.24 / 1_000_000, "output": 0.24 / 1_000_000},
     "gemma2-9b-it": {"input": 0.20 / 1_000_000, "output": 0.20 / 1_000_000},
 }
@@ -115,7 +116,22 @@ def init_db():
     with open(schema_path, "r") as f:
         schema_sql = f.read()
 
-    conn = psycopg2.connect(DATABASE_URL)
+    import time
+    retries = 5
+    delay = 3.0
+    conn = None
+    for i in range(retries):
+        try:
+            logger.info(f"Connecting to database (attempt {i+1}/{retries})...")
+            conn = psycopg2.connect(DATABASE_URL)
+            break
+        except Exception as e:
+            if i == retries - 1:
+                logger.critical(f"Failed to connect to database after {retries} attempts.")
+                raise e
+            logger.warning(f"Database connection failed: {e}. Retrying in {delay}s...")
+            time.sleep(delay)
+
     try:
         with conn.cursor() as cur:
             cur.execute(schema_sql)
@@ -126,7 +142,8 @@ def init_db():
         logger.error(f"Failed to apply SQL migrations: {e}")
         raise e
     finally:
-        conn.close()
+        if conn:
+            conn.close()
 
 # Auto-apply database migration schema and preload ML models on worker ready
 @worker_ready.connect

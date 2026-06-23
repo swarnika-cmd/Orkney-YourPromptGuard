@@ -1,5 +1,6 @@
 # 🛡️ ShieldWall Gateway: Enterprise LLM Security & Telemetry Control Room
 
+![ShieldWall Gateway Dashboard](dashboard.png)
 ShieldWall Gateway is a high-throughput, self-hosted, operational LLM proxy, data-redaction engine, and real-time observability control room. It provides robust perimeter defense for enterprise LLM integrations—protecting infrastructure budgets via atomic token-based rate limits, redacting sensitive PII/secrets before they reach public APIs, and validating generation quality in real-time.
 
 All operations—from security filtering to full-stack dashboard visualization—are served from a unified, single-port gateway layout with an asynchronous background evaluation queue.
@@ -187,6 +188,7 @@ CREATE INDEX IF NOT EXISTS idx_timestamp_latency ON request_logs(timestamp DESC,
 
 3.  **Access the Applications**:
     *   **Admin Dashboard Cockpit**: [http://localhost:8000/](http://localhost:8000/)
+    *   **Interactive Swagger API Docs**: [http://localhost:8000/docs](http://localhost:8000/docs)
     *   **LLM Gateway Endpoint**: `http://localhost:8000/v1/chat/completions` (Compatible with any standard OpenAI SDK wrapper)
     *   **API Telemetry Endpoints**:
         *   Summary Metrics: `GET http://localhost:8000/api/analytics/summary`

@@ -7,11 +7,25 @@ import re
 from contextlib import asynccontextmanager
 from typing import List, Dict, Any
 
-from fastapi import FastAPI, Request, Response, HTTPException, status, BackgroundTasks
+from fastapi import FastAPI, Request, Response, HTTPException, status, BackgroundTasks, Header, Body
 from fastapi.responses import StreamingResponse, JSONResponse
 import httpx
 import redis.asyncio as aioredis
 import tiktoken
+from pydantic import BaseModel, Field, ConfigDict
+
+class ChatMessage(BaseModel):
+    role: str = Field(..., description="Role of the message author (system, user, assistant)")
+    content: Any = Field(..., description="Content of the message (string, or block list)")
+
+class ChatCompletionRequest(BaseModel):
+    model_config = ConfigDict(extra='allow')
+    
+    model: str = Field(default="gpt-4o-mini", description="The LLM model to use (e.g. llama-3.1-8b-instant, gpt-4o-mini)")
+    messages: List[ChatMessage] = Field(..., description="List of messages in the conversation")
+    stream: bool = Field(default=False, description="If true, response chunks will be streamed")
+    user_query: str | None = Field(default=None, description="User query for RAG quality evaluation")
+    rag_context: List[str] | None = Field(default=None, description="Retrieved document chunks for RAG evaluation")
 
 # Configure Logger
 logging.basicConfig(level=logging.INFO)
@@ -30,6 +44,7 @@ MODEL_PRICING = {
     "llama3-70b-8192": {"input": 0.59 / 1_000_000, "output": 0.79 / 1_000_000},
     "llama-3.1-8b-instant": {"input": 0.05 / 1_000_000, "output": 0.08 / 1_000_000},
     "llama-3.1-70b-versatile": {"input": 0.59 / 1_000_000, "output": 0.79 / 1_000_000},
+    "llama-3.3-70b-versatile": {"input": 0.59 / 1_000_000, "output": 0.79 / 1_000_000},
     "mixtral-8x7b-32768": {"input": 0.24 / 1_000_000, "output": 0.24 / 1_000_000},
     "gemma2-9b-it": {"input": 0.20 / 1_000_000, "output": 0.20 / 1_000_000},
 }
@@ -577,9 +592,12 @@ async def handle_non_streaming_proxy(
         response_text=response_text
     )
 
-    # Forward upstream response headers cleanly, adjusting Content-Length
-    resp_headers = dict(response.headers)
-    resp_headers.pop("content-length", None)
+    # Forward upstream response headers cleanly, removing transport/encoding headers
+    resp_headers = {}
+    for k, v in response.headers.items():
+        k_lower = k.lower()
+        if k_lower not in ("content-length", "content-encoding", "transfer-encoding", "connection", "content-type"):
+            resp_headers[k] = v
     return JSONResponse(
         content=response_json,
         status_code=response.status_code,
@@ -782,15 +800,22 @@ async def handle_streaming_proxy(
         media_type="text/event-stream"
     )
 
-@app.post("/v1/chat/completions")
-async def chat_completions(request: Request, background_tasks: BackgroundTasks):
-    # 1. Enforce custom project billing header
-    project_id = request.headers.get("X-Project-ID")
-    if not project_id:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Missing required X-Project-ID header for rate/budget limiting"
-        )
+@app.post("/v1/chat/completions", tags=["LLM Gateway Proxy"], summary="Proxy Chat Completion request to Upstream Provider")
+async def chat_completions(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    body: ChatCompletionRequest = Body(..., example={
+        "model": "llama-3.1-8b-instant",
+        "messages": [
+            {"role": "user", "content": "Hello, how are you? My email is test@example.com"}
+        ],
+        "stream": False,
+        "user_query": "Hello",
+        "rag_context": ["Greetings and friendly banter"]
+    }),
+    x_project_id: str = Header(..., alias="X-Project-ID", description="Project/Tenant ID for rate limiting and budget tracking")
+):
+    project_id = x_project_id
 
     # 2. Synchronous budget constraint check
     current_spend = await check_project_budget(project_id)
@@ -818,21 +843,15 @@ async def chat_completions(request: Request, background_tasks: BackgroundTasks):
         )
 
     # 3. Parse JSON Body
-    try:
-        body = await request.json()
-    except Exception:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid request body. Content must be JSON."
-        )
+    body_dict = body.model_dump(exclude_none=True)
 
     # Intercept RAG evaluation metadata from body (pop to avoid forwarding to provider)
-    user_query = body.pop("user_query", None)
-    rag_context = body.pop("rag_context", None)
+    user_query = body_dict.pop("user_query", None)
+    rag_context = body_dict.pop("rag_context", None)
 
-    model = body.get("model", "gpt-4o-mini")
-    messages = body.get("messages", [])
-    is_stream = body.get("stream", False)
+    model = body_dict.get("model", "gpt-4o-mini")
+    messages = body_dict.get("messages", [])
+    is_stream = body_dict.get("stream", False)
 
     # Generate a unique Request ID (trace namespace)
     request_id = f"req_{int(time.time() * 1000)}_{os.urandom(4).hex()}"
@@ -857,20 +876,20 @@ async def chat_completions(request: Request, background_tasks: BackgroundTasks):
             masked_msg["content"] = new_content
         masked_messages.append(masked_msg)
         
-    body["messages"] = masked_messages
+    body_dict["messages"] = masked_messages
 
     # Store the trace PII mapping in Redis hash with 5m TTL
     if mappings:
         await save_pii_mappings(request_id, mappings)
 
     # Re-estimate input tokens based on masked messages to forward correct stats
-    input_tokens = estimate_input_tokens(body["messages"], model)
+    input_tokens = estimate_input_tokens(body_dict["messages"], model)
 
     # Ensure upstream returns usage in streaming mode
     if is_stream:
-        if "stream_options" not in body:
-            body["stream_options"] = {}
-        body["stream_options"]["include_usage"] = True
+        if "stream_options" not in body_dict:
+            body_dict["stream_options"] = {}
+        body_dict["stream_options"]["include_usage"] = True
 
     # 4. Forwarding Authorization Credentials
     auth_header = request.headers.get("Authorization")
@@ -889,7 +908,7 @@ async def chat_completions(request: Request, background_tasks: BackgroundTasks):
 
     if is_stream:
         return await handle_streaming_proxy(
-            body=body,
+            body=body_dict,
             headers=headers,
             project_id=project_id,
             request_id=request_id,
@@ -902,7 +921,7 @@ async def chat_completions(request: Request, background_tasks: BackgroundTasks):
         )
     else:
         return await handle_non_streaming_proxy(
-            body=body,
+            body=body_dict,
             headers=headers,
             project_id=project_id,
             request_id=request_id,
@@ -914,7 +933,7 @@ async def chat_completions(request: Request, background_tasks: BackgroundTasks):
             rag_context=rag_context
         )
 
-@app.get("/api/analytics")
+@app.get("/api/analytics", tags=["Dashboard Metrics & Analytics"], summary="Retrieve lookback-specific aggregate analytics")
 async def get_analytics(window: str = "24h"):
     if window not in ["1h", "24h", "30d"]:
         raise HTTPException(status_code=400, detail="Invalid window parameter. Choose from 1h, 24h, 30d.")
@@ -949,7 +968,7 @@ async def get_analytics(window: str = "24h"):
         logger.error(f"Error fetching analytics: {e}")
         raise HTTPException(status_code=500, detail="Database query failed.")
 
-@app.get("/api/analytics/tenants")
+@app.get("/api/analytics/tenants", tags=["Dashboard Metrics & Analytics"], summary="Retrieve token costs broken down by tenant")
 async def get_tenant_spend(window: str = "24h"):
     if window not in ["1h", "24h", "30d"]:
         raise HTTPException(status_code=400, detail="Invalid window parameter. Choose from 1h, 24h, 30d.")
@@ -984,7 +1003,7 @@ async def get_tenant_spend(window: str = "24h"):
         logger.error(f"Error fetching tenant spend: {e}")
         raise HTTPException(status_code=500, detail="Database query failed.")
 
-@app.get("/api/analytics/summary")
+@app.get("/api/analytics/summary", tags=["Dashboard Metrics & Analytics"], summary="Retrieve lifetime aggregate KPIs")
 async def get_analytics_summary():
     query = """
         SELECT 
@@ -1007,7 +1026,7 @@ async def get_analytics_summary():
         logger.error(f"Error fetching analytics summary: {e}")
         raise HTTPException(status_code=500, detail="Database query failed.")
 
-@app.get("/api/security/logs")
+@app.get("/api/security/logs", tags=["Security & Compliance"], summary="Retrieve live security violation and masking logs")
 async def get_security_logs():
     query = """
         SELECT 
@@ -1050,7 +1069,7 @@ async def get_security_logs():
         logger.error(f"Error fetching security logs: {e}")
         raise HTTPException(status_code=500, detail="Database query failed.")
 
-@app.get("/health")
+@app.get("/health", tags=["System Diagnostics"], summary="System health check status")
 async def health_check():
     redis_status = "unconnected"
     if redis_client:
