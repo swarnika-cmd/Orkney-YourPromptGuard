@@ -216,7 +216,7 @@ outbound_payload_with_pii = {
     "messages": [
         {
             "role": "user",
-            "content": "Contact me at user@example.com or call 123-45-6789. Also my server has AWS_SECRET_ACCESS_KEY=abcd1234abcd1234abcd1234abcd1234abcd1234. Keep it safe!"
+            "content": "Contact me at user@example.com or call 123-45-6789. Also my server has AWS_SECRET_ACCESS_KEY=my-mock-aws-secret-key-value. Keep it safe!"
         }
     ]
 }
